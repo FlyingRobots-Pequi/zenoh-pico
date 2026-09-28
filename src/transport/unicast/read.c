@@ -15,15 +15,58 @@
 #include "zenoh-pico/transport/unicast/read.h"
 
 #include <stddef.h>
+#include <stdint.h>
 
 #include "zenoh-pico/api/types.h"
 #include "zenoh-pico/config.h"
 #include "zenoh-pico/protocol/codec/transport.h"
 #include "zenoh-pico/session/interest.h"
+#include "zenoh-pico/system/common/platform.h"
 #include "zenoh-pico/transport/common/rx.h"
 #include "zenoh-pico/transport/transport.h"
 #include "zenoh-pico/transport/unicast/rx.h"
 #include "zenoh-pico/utils/logging.h"
+
+// ===================== INSTRUMENTACAO TEMPORARIA (2026-09-24) =====================
+// Contadores para localizar ONDE a read task para de drenar o socket TCP
+// (local_position_diagnostico_2026-09-23.md, secao 6). Lidos por `zenoh status`
+// -> ZENOH::print_status() em src/modules/zenoh/zenoh.cpp, que roda na thread do
+// shell e continua respondendo com a read task travada.
+//
+// Sao "in"/"out" em pares de propósito: o par cujo delta (in - out) fica preso em
+// 1 e a moldura onde a thread parou. Ler DUAS vezes com ~1 s de intervalo: o que
+// distingue travado de apenas lento e o contador nao andar entre as amostras.
+//
+// REMOVER quando o bug estiver fechado.
+volatile uint32_t g_zp_loop;         // iteracoes do while do read task
+volatile uint32_t g_zp_recv_in;      // chamadas a _z_unicast_client_read
+volatile uint32_t g_zp_recv_out;     // retornos dela (in>out = preso no recv)
+volatile uint32_t g_zp_recv_data;    // retornos COM dados (true)
+volatile uint32_t g_zp_proc_in;      // entradas em _z_unicast_process_messages
+volatile uint32_t g_zp_proc_out;     // saidas dela
+volatile uint32_t g_zp_handle_in;    // entradas em _z_unicast_handle_transport_message
+volatile uint32_t g_zp_handle_out;   // saidas dela (in>out = preso no dispatch,
+                                     // que e por onde o callback do subscriber roda)
+// Diagnostico do batch: se o router mandar um batch maior que a capacidade do
+// _zbuf (que vale o _batch_size NEGOCIADO, ver unicast/transport.c:58), entao
+// _z_zbuf_len < to_read e insatisfazivel e o laco abaixo rebobina/compacta/
+// devolve false PARA SEMPRE, sem nunca consumir os bytes. g_zp_toread_max >
+// g_zp_zbuf_cap prova esse caso.
+volatile uint32_t g_zp_short_read;   // vezes que bailou por faltar byte
+volatile uint32_t g_zp_toread_last;  // ultimo to_read pedido
+volatile uint32_t g_zp_toread_max;   // maior to_read ja visto
+volatile uint32_t g_zp_zbuf_cap;     // capacidade do _zbuf
+volatile uint32_t g_zp_zbuf_len;     // preenchimento no momento do bail
+// O que o recv() efetivamente devolve. _z_link_socket_recv_zbuf devolve
+// SIZE_MAX em EAGAIN (timeout do SO_RCVTIMEO, link vivo e sem dado) e 0 em EOF
+// (peer fechou). Distinguir os dois e o que separa "o kernel nao tem dado" de
+// "o socket morreu" -- indistinguiveis pelos contadores anteriores.
+volatile uint32_t g_zp_rv_bytes;     // chamadas que devolveram N>0
+volatile uint32_t g_zp_rv_zero;      // devolveram 0   (EOF)
+volatile uint32_t g_zp_rv_eagain;    // devolveram SIZE_MAX (timeout/EAGAIN)
+volatile uint32_t g_zp_rv_last;      // ultimo N devolvido (SIZE_MAX vira 0xFFFFFFFF)
+volatile uint32_t g_zp_rv_total;     // soma de bytes recebidos
+// ==================================================================================
 
 #define _Z_UNICAST_PEER_READ_STATUS_OK 0
 #define _Z_UNICAST_PEER_READ_STATUS_PENDING_DATA -1
@@ -52,7 +95,9 @@ static z_result_t _z_unicast_process_messages(_z_transport_unicast_t *ztu, _z_tr
             _Z_INFO("Connection compromised due to malformed message: %d", ret);
             return ret;
         }
+        g_zp_handle_in++;  // INSTRUMENTACAO
         ret = _z_unicast_handle_transport_message(ztu, &t_msg, peer);
+        g_zp_handle_out++;  // INSTRUMENTACAO
         if (ret != _Z_RES_OK) {
             if (ret != _Z_ERR_CONNECTION_CLOSED) {
                 _Z_WARN("Connection compromised due to message processing error: %d", ret);
@@ -74,11 +119,62 @@ static z_result_t _z_unicast_process_messages(_z_transport_unicast_t *ztu, _z_tr
     return _Z_RES_OK;
 }
 
+// INSTRUMENTACAO: contabiliza um retorno de _z_link_socket_recv_zbuf
+static inline void _zp_count_recv(size_t rb) {
+    if (rb == SIZE_MAX) {
+        g_zp_rv_eagain++;
+        g_zp_rv_last = 0xFFFFFFFFu;
+    } else if (rb == 0) {
+        g_zp_rv_zero++;
+        g_zp_rv_last = 0;
+    } else {
+        g_zp_rv_bytes++;
+        g_zp_rv_last = (uint32_t)rb;
+        g_zp_rv_total += (uint32_t)rb;
+    }
+}
+
 static bool _z_unicast_client_read(_z_transport_unicast_t *ztu, _z_transport_peer_unicast_t *peer, size_t *to_read) {
     switch (ztu->_common._link->_cap._flow) {
         case Z_LINK_CAP_FLOW_STREAM:
+            // rb == 0 means the socket returned a clean EOF (peer closed the TCP connection):
+            // recv() does NOT block for that, it returns immediately, every single call. A live
+            // connection with merely no data pending returns SIZE_MAX instead (EAGAIN, after
+            // blocking up to SO_RCVTIMEO) -- that case does not busy-loop and is left alone.
+            //
+            // In CLIENT mode (our case: net.txt says `client;tcp/...`) nothing else here checks
+            // for EOF, so without this sleep the caller's while(!should_exit()) loop spins this
+            // thread at ~100% CPU with no delay, for as long as it takes the lease task to notice
+            // (Z_TRANSPORT_LEASE, 60s) -- and worse, while spinning it keeps _mutex_rx held and
+            // keeps touching _link/_zbuf, which is exactly the state _zp_unicast_failed() then
+            // tears down. See the join-not-detach fix in transport/common/transport.c for why
+            // that specific race can corrupt memory; this sleep only bounds how long the CPU
+            // burns and how often the race window is hit -- it doesn't fix the race by itself.
+            //
+            // The two `if` guards below are unchanged from upstream on purpose: they skip the
+            // recv() call once enough bytes are already buffered from a prior partial read, and
+            // duplicating that recv() here would silently double the worst-case per-iteration
+            // block time (up to 2x SO_RCVTIMEO instead of 1x) on a healthy but momentarily idle
+            // connection. What is new here is the EOF check and the compaction right below.
+            //
+            // Compact FIRST, on every call. Upstream only compacts when bailing out, so after a
+            // batch is processed the leftover bytes stay at the END of the buffer (r_pos == the
+            // size of the batch just consumed). The next recv() then only has `cap - w_pos` bytes
+            // of room -- and when a previous recv() filled the buffer to the brim, that room is
+            // ZERO: recv(len = 0) returns 0 immediately, which is indistinguishable from EOF and
+            // hit the 50 ms sleep above ONCE PER MESSAGE. Measured on the bench (2026-09-26): the
+            // FCU drained ~18 msg/s, the router went rwnd-limited 78% of the time at 30 Hz of
+            // visual odometry, and the backlog is what made the TCP receive race in NuttX
+            // (net/tcp/tcp_recvfrom.c) fire. With the leftover moved to the start, the room is
+            // always >= batch_size - len (the zbuf holds batch_size + 2, see transport.c), so a
+            // recv() is never issued with zero room and rb == 0 means a real EOF again.
+            _z_zbuf_compact(&ztu->_common._zbuf);
             if (_z_zbuf_len(&ztu->_common._zbuf) < _Z_MSG_LEN_ENC_SIZE) {
-                _z_link_socket_recv_zbuf(ztu->_common._link, &ztu->_common._zbuf, peer->_socket);
+                size_t rb = _z_link_socket_recv_zbuf(ztu->_common._link, &ztu->_common._zbuf, peer->_socket);
+                _zp_count_recv(rb);  // INSTRUMENTACAO
+                if (rb == 0) {
+                    z_sleep_ms(50);
+                }
                 if (_z_zbuf_len(&ztu->_common._zbuf) < _Z_MSG_LEN_ENC_SIZE) {
                     _z_zbuf_compact(&ztu->_common._zbuf);
                     return false;
@@ -88,8 +184,18 @@ static bool _z_unicast_client_read(_z_transport_unicast_t *ztu, _z_transport_pee
             *to_read = _z_read_stream_size(&ztu->_common._zbuf);
             // Read data
             if (_z_zbuf_len(&ztu->_common._zbuf) < *to_read) {
-                _z_link_socket_recv_zbuf(ztu->_common._link, &ztu->_common._zbuf, peer->_socket);
+                size_t rb = _z_link_socket_recv_zbuf(ztu->_common._link, &ztu->_common._zbuf, peer->_socket);
+                _zp_count_recv(rb);  // INSTRUMENTACAO
+                if (rb == 0) {
+                    z_sleep_ms(50);
+                }
                 if (_z_zbuf_len(&ztu->_common._zbuf) < *to_read) {
+                    // INSTRUMENTACAO
+                    g_zp_short_read++;
+                    g_zp_toread_last = (uint32_t)*to_read;
+                    if ((uint32_t)*to_read > g_zp_toread_max) { g_zp_toread_max = (uint32_t)*to_read; }
+                    g_zp_zbuf_cap = (uint32_t)_z_zbuf_capacity(&ztu->_common._zbuf);
+                    g_zp_zbuf_len = (uint32_t)_z_zbuf_len(&ztu->_common._zbuf);
                     _z_zbuf_set_rpos(&ztu->_common._zbuf, _z_zbuf_get_rpos(&ztu->_common._zbuf) - _Z_MSG_LEN_ENC_SIZE);
                     _z_zbuf_compact(&ztu->_common._zbuf);
                     return false;
@@ -340,6 +446,7 @@ void *_zp_unicast_read_task(void *ztu_arg) {
         assert(curr_peer != NULL);
     }
     while (ztu->_common._read_task_running) {
+        g_zp_loop++;  // INSTRUMENTACAO
 #if Z_FEATURE_UNICAST_PEER == 1
         if (mode == Z_WHATAMI_PEER) {
             // Wait for at least one peer
@@ -361,11 +468,18 @@ void *_zp_unicast_read_task(void *ztu_arg) {
         {
             size_t to_read = 0;
             // Retrieve data
-            if (!_z_unicast_client_read(ztu, curr_peer, &to_read)) {
+            g_zp_recv_in++;  // INSTRUMENTACAO
+            bool got = _z_unicast_client_read(ztu, curr_peer, &to_read);
+            g_zp_recv_out++;  // INSTRUMENTACAO
+            if (!got) {
                 continue;
             }
+            g_zp_recv_data++;  // INSTRUMENTACAO
             // Process data
-            if (_z_unicast_process_messages(ztu, curr_peer, to_read) != _Z_RES_OK) {
+            g_zp_proc_in++;  // INSTRUMENTACAO
+            z_result_t pret = _z_unicast_process_messages(ztu, curr_peer, to_read);
+            g_zp_proc_out++;  // INSTRUMENTACAO
+            if (pret != _Z_RES_OK) {
                 ztu->_common._read_task_running = false;
                 continue;
             }

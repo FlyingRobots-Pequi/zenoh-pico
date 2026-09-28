@@ -55,7 +55,27 @@ static z_result_t _z_unicast_transport_create_inner(_z_transport_unicast_t *ztu,
     // Initialize the read and write buffers
     uint16_t mtu = (zl->_mtu < param->_batch_size) ? zl->_mtu : param->_batch_size;
     size_t wbuf_size = mtu;
+    // Em link de STREAM (TCP) o zbuf precisa caber o batch INTEIRO **mais** o
+    // prefixo de tamanho de 2 bytes (_Z_MSG_LEN_ENC_SIZE), porque esse prefixo e
+    // lido de dentro do proprio zbuf (unicast/read.c, _z_read_stream_size).
+    //
+    // Com zbuf == batch_size, um batch de tamanho MAXIMO trava a leitura para
+    // sempre: o recv enche o buffer com batch_size bytes, o prefixo consome 2,
+    // sobram batch_size-2 de payload, e a condicao `_z_zbuf_len < to_read` fica
+    // insatisfazivel -- nao ha para onde crescer. O laco entao rebobina o rpos,
+    // compacta e devolve false a cada iteracao, sem NUNCA consumir os bytes:
+    // a thread gira a 100% sem entregar nada, o socket para de ser drenado e a
+    // sessao morre em silencio, mantida viva so pelos keepalives.
+    //
+    // Diagnosticado na bancada em 2026-09-25: BATCH_UNICAST_SIZE=256 (override do
+    // PX4; o default do zenoh-pico e 65535) e o router agregando varias amostras
+    // num batch -- dai o tempo ate travar ser variavel e nao correlacionar com a
+    // taxa de publicacao.
     size_t zbuf_size = param->_batch_size;
+
+    if (zl->_cap._flow == Z_LINK_CAP_FLOW_STREAM) {
+        zbuf_size += _Z_MSG_LEN_ENC_SIZE;
+    }
     // Initialize tx rx buffers
     ztu->_common._wbuf = _z_wbuf_make(wbuf_size, false);
     ztu->_common._zbuf = _z_zbuf_make(zbuf_size);
